@@ -1,0 +1,70 @@
+# ============================================================================
+# AYNI · Backend — Deploy en Render
+# Encadenado al CI: solo despliega si el run de "CI" terminó en verde y
+# correspondía a un push a main (los PRs no despliegan). También se puede
+# lanzar a mano desde la pestaña Actions (workflow_dispatch).
+# Requisito en Render: Auto-Deploy en OFF para evitar despliegues duplicados.
+# ============================================================================
+name: Deploy
+
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Nunca dos despliegues en paralelo; se encolan en lugar de cancelarse.
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Trigger Render deploy
+    runs-on: ubuntu-latest
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push' &&
+       github.event.workflow_run.head_branch == 'main')
+    environment:
+      name: production
+      url: https://backend-mqef.onrender.com
+    env:
+      BASE_URL: https://backend-mqef.onrender.com
+    steps:
+      - name: Trigger deploy hook
+        env:
+          HOOK: ${{ secrets.HOOK_RENDER_BACKEND }}
+        run: |
+          if [ -z "$HOOK" ]; then
+            echo "::error::Falta el secreto HOOK_RENDER_BACKEND en Settings → Secrets and variables → Actions."
+            exit 1
+          fi
+          curl -fsS -X POST "$HOOK" -o /dev/null
+          echo "Despliegue solicitado a Render."
+
+      - name: Esperar a que Render construya y publique la nueva versión
+        run: sleep 180
+
+      - name: Smoke test (/api/health y /health/db)
+        run: |
+          comprobar() {
+            ruta="$1"
+            for i in $(seq 1 20); do
+              codigo=$(curl -s -o /tmp/respuesta -w '%{http_code}' --max-time 60 "$BASE_URL$ruta" || true)
+              if [ "$codigo" = "200" ]; then
+                echo "$ruta → 200 $(cat /tmp/respuesta)"
+                return 0
+              fi
+              echo "$ruta → $codigo (intento $i/20), reintentando en 30 s..."
+              sleep 30
+            done
+            echo "::error::$ruta no respondió 200 tras el despliegue."
+            return 1
+          }
+          comprobar /api/health
+          comprobar /health/db

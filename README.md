@@ -5,12 +5,12 @@ API REST de la plataforma AYNI para la gestión de ollas comunes.
 ## Requisitos
 
 - [uv](https://docs.astral.sh/uv/) y Python 3.12+
-- Proyecto de Supabase (PostgreSQL) con `../sql/001_ayni_postgres.sql` aplicado
+- Proyecto de Supabase (PostgreSQL) con el esquema `sql/001_ayni_postgres.sql` aplicado (vive en el repositorio principal `FlorDazu/-AYNI-`)
 - Sin drivers nativos: `psycopg[binary]` + `psycopg_pool`
 
 ## Puesta en marcha
 
-1. Ejecute `../sql/001_ayni_postgres.sql` en el SQL Editor de Supabase (crea el esquema `dbo`, tablas, funciones y datos semilla).
+1. Ejecute `sql/001_ayni_postgres.sql` (repositorio `-AYNI-`) en el SQL Editor de Supabase (crea el esquema `dbo`, tablas, funciones y datos semilla).
 2. Copie `.env.example` a `.env` y complete `DATABASE_URL` (Session pooler, contraseña URL-encodeada), `JWT_SECRET` y `API_NINJAS_KEY`. Toda la configuración se lee en `app/core/config.py`.
 3. Instale dependencias y levante la API (sin `--reload`):
 
@@ -54,13 +54,14 @@ Al arrancar, la API reemplaza los `password_hash = 'PENDING_HASH'` por hashes bc
 Las rutas con datos de una olla usan la olla de la dirigenta autenticada. Un `ADMIN` puede consultarlas
 indicando `?id_olla=N`.
 
-## Despliegue en Render con Docker (manual)
+## Despliegue en Render con Docker
 
-La imagen se define en `Dockerfile` (Python 3.12 slim + `uv sync --frozen --no-dev`, usuario sin privilegios,
-`uvicorn` en `0.0.0.0:$PORT`). `.dockerignore` excluye `.env`, `.venv`, `tests/` y cachés: **los secretos nunca
-entran en la imagen**.
+- **URL pública:** <https://backend-mqef.onrender.com> · Swagger: `/docs` · Salud: `/api/health` · Base de datos: `/health/db`
+- La imagen se define en `Dockerfile` (Python 3.12 slim + `uv sync --frozen --no-dev`, usuario sin privilegios,
+  `uvicorn` en `0.0.0.0:$PORT`). `.dockerignore` excluye `.env`, `.venv`, `tests/` y cachés: **los secretos nunca
+  entran en la imagen**.
 
-### 1 · Probar la imagen en local (Docker Desktop encendido, desde `backend/`)
+### Probar la imagen en local (Docker Desktop encendido, desde la raíz del repo)
 
 ```powershell
 docker build -t ayni-backend .
@@ -72,21 +73,16 @@ docker run --rm -p 8001:8001 -e PORT=8001 --env-file .env ayni-backend
 
 Verifique `http://127.0.0.1:8001/api/health` y `http://127.0.0.1:8001/health/db` (debe responder `{"status": "ok"}`).
 
-### 2 · Subir a GitHub
-
-Commit en la rama `backend`, `git push origin backend`, Pull Request `backend → main` y merge con el CI en verde.
-Render despliega desde `main`.
-
-### 3 · Crear el Web Service en Render (New → Web Service → repositorio `-AYNI-`)
+### Configuración del Web Service en Render
 
 | Campo | Valor |
 |---|---|
-| Name | `ayni-backend` → `https://ayni-backend.onrender.com` (si el nombre está ocupado, use la URL que asigne Render) |
-| Branch | `main` |
+| Repositorio / rama | `FlorDazu/Backend` / `main` |
 | Language | Docker |
-| Root Directory | `backend` |
+| Root Directory | *(vacío: el `Dockerfile` está en la raíz)* |
 | Dockerfile Path | `./Dockerfile` |
 | Health Check Path | `/api/health` (no use `/health/db`: una caída de Supabase reiniciaría el contenedor en bucle) |
+| Auto-Deploy | **Off** (el despliegue lo dispara GitHub Actions, ver sección CI/CD) |
 | Instance Type | Free (se suspende tras ~15 min sin tráfico; la primera petición tarda ~50 s) |
 
 Variables de entorno (*Environment*), sin comillas:
@@ -98,15 +94,33 @@ Variables de entorno (*Environment*), sin comillas:
 | `JWT_ALGORITHM` | `HS256` |
 | `JWT_EXPIRE_MINUTES` | `480` |
 | `API_NINJAS_KEY` | Clave de api-ninjas.com |
-| `CORS_ORIGINS` | Vacío por ahora (`http://localhost:4200` siempre está permitido). Al desplegar el frontend: su origen sin `/` final |
+| `CORS_ORIGINS` | Origen del frontend desplegado, sin `/` final (p. ej. `https://ayni-frontend.onrender.com`). `http://localhost:4200` siempre está permitido |
 
 `PORT` no se define: Render lo inyecta.
 
-### 4 · Verificar
+## CI/CD con GitHub Actions
 
-- `https://ayni-backend.onrender.com/api/health`
-- `https://ayni-backend.onrender.com/health/db` → `{"status": "ok"}`
-- `https://ayni-backend.onrender.com/docs` → login con una cuenta semilla y prueba de un endpoint protegido.
+Dos workflows en `.github/workflows/`:
 
-Cuando se despliegue el frontend, su `apiUrl` de producción será `https://ayni-backend.onrender.com/api`
-(con `/api` al final) y su origen debe añadirse a `CORS_ORIGINS` en Render.
+**`ci.yml` — CI** (en cada `push` y `pull_request` hacia `main`)
+
+| Job | Qué ejecuta |
+|---|---|
+| `test` | `astral-sh/setup-uv` (0.13.1) → `uv sync --frozen` → carga de la app → `uv run pytest` |
+| `docker` (`needs: test`) | `docker/setup-buildx-action` → `docker/build-push-action` con `push: false` y caché `type=gha` (solo valida que la imagen construye; Render la construye al recibir el hook) → arranca el contenedor y comprueba `GET /api/health` sin base de datos ni secretos |
+
+**`deploy.yml` — Deploy** (encadenado con `workflow_run` al workflow `CI`)
+
+- Solo corre si el run de `CI` terminó en **verde** y venía de un **push a `main`** (los PR nunca despliegan), o si se lanza a mano con `workflow_dispatch`.
+- Usa el entorno `production` (`https://backend-mqef.onrender.com`) y `concurrency: deploy-production` (los despliegues se encolan, nunca en paralelo).
+- Pasos: `curl -fsS -X POST` al Deploy Hook de Render → espera de 3 min → **smoke test** de `/api/health` y `/health/db` (hasta 20 reintentos cada 30 s; el job falla si no responden `200`).
+
+**Secreto requerido:** `HOOK_RENDER_BACKEND` (*Settings → Secrets and variables → Actions*), con la **Deploy Hook URL**
+del servicio (Render → *Settings → Deploy Hook*). Solo se usa en el job de despliegue y GitHub lo oculta en los logs.
+
+> ⚠️ **Desactive Auto-Deploy en Render** (*Settings → Build & Deploy → Auto-Deploy: Off*). Si queda activo, cada push
+> a `main` despliega **dos veces** (una por Render y otra por el workflow) y Render publicaría incluso commits con
+> pruebas en rojo.
+
+Si el smoke test de `/health/db` falla con `503`, revise que el proyecto de Supabase no esté pausado y que
+`DATABASE_URL` en Render sea correcta.
