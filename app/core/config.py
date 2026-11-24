@@ -62,6 +62,9 @@ class Settings(BaseSettings):
 
     # --- Recetario externo -------------------------------------------------------
     api_ninjas_key: str = ""
+    # Opcional: clave de Google Cloud Translation API (traducción oficial y estable).
+    # Sin ella se usan traductores gratuitos (Google sin clave → MyMemory).
+    google_translate_api_key: str = ""
 
     @field_validator("cors_origins", mode="before")
     @classmethod
@@ -71,7 +74,7 @@ class Settings(BaseSettings):
             return [origen.strip() for origen in valor.split(",") if origen.strip()]
         return valor
 
-    @field_validator("database_url", "api_ninjas_key", "jwt_secret", mode="before")
+    @field_validator("database_url", "api_ninjas_key", "google_translate_api_key", "jwt_secret", mode="before")
     @classmethod
     def recortar(cls, valor: Any) -> Any:
         return valor.strip() if isinstance(valor, str) else valor

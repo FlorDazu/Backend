@@ -1,15 +1,17 @@
 """HU-12: Calculadora de recetas locales, despacho atómico y recetario nutricional (API Ninjas)."""
 
 import asyncio
+import html
 import logging
 import re
+import time
 import unicodedata
 from decimal import ROUND_HALF_UP, Decimal
-from typing import Any
+from typing import Any, Callable
 
 import httpx
 import psycopg
-from deep_translator import GoogleTranslator
+from deep_translator import GoogleTranslator, MyMemoryTranslator
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 
 from app.core.config import settings
@@ -276,52 +278,27 @@ def _normalizar(item: dict[str, Any]) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# Traducción automática (GoogleTranslator de deep-translator, sin API key)
+# Traducción automática inglés → español con cadena de proveedores
+#
+#   1. Google Cloud Translation API (oficial) — solo si GOOGLE_TRANSLATE_API_KEY
+#      está configurada; traduce listas completas en una sola petición.
+#   2. Google Translate gratuito (deep-translator) — sin clave, pero Google lo
+#      bloquea con frecuencia (TooManyRequests); tras un bloqueo se omite unos
+#      minutos para no insistir.
+#   3. MyMemory (deep-translator) — gratuito, sin clave, máx. ~500 caracteres
+#      por petición.
+#   4. Si todos fallan: el texto queda en inglés (se registra en el log).
+#
+# Las porciones ("1 Servings") se convierten siempre con una regla propia, sin
+# depender de ningún proveedor. Solo se guardan en caché las búsquedas que se
+# tradujeron por completo, para reintentar las que fallaron.
 # ---------------------------------------------------------------------------
 
-# Caché en memoria de búsquedas ya resueltas: llave = término buscado en
-# minúsculas y sin tildes. Guarda la respuesta de API Ninjas tal cual se
-# devolvió (en español si el traductor respondió, o en inglés si falló
-# temporalmente — el mismo respaldo del requisito), de modo que una búsqueda
-# repetida se responda al instante sin volver a llamar a Google ni a API Ninjas.
 _CACHE_RECETAS: dict[str, dict[str, Any]] = {}
 _CACHE_MAXIMO = 100
-_LIMITE_GOOGLE = 4500  # GoogleTranslator acepta menos de 5000 caracteres por llamada
-
-
-def _traducir_texto(traductor: GoogleTranslator, texto: str) -> str:
-    """Traduce un texto; si supera el límite de Google, lo parte en trozos por palabras."""
-    texto = texto.strip()
-    if not texto:
-        return texto
-    if len(texto) < _LIMITE_GOOGLE:
-        return (traductor.translate(texto) or texto).strip()
-    trozos: list[str] = []
-    actual = ""
-    for palabra in texto.split():
-        if actual and len(actual) + len(palabra) + 1 >= _LIMITE_GOOGLE:
-            trozos.append(actual)
-            actual = palabra
-        else:
-            actual = f"{actual} {palabra}".strip()
-    if actual:
-        trozos.append(actual)
-    return " ".join((traductor.translate(t) or t).strip() for t in trozos)
-
-
-def _traducir_lineas(traductor: GoogleTranslator, lineas: list[str]) -> list[str]:
-    """Traduce una lista de textos en una sola llamada (separados por salto de línea).
-
-    Si Google no conserva la cantidad de líneas, traduce elemento por elemento.
-    """
-    if not lineas:
-        return lineas
-    unidas = _traducir_texto(traductor, "\n".join(lineas))
-    traducidas = [linea.strip() for linea in unidas.split("\n") if linea.strip()]
-    if len(traducidas) == len(lineas):
-        return traducidas
-    return [(_traducir_texto(traductor, linea) or linea).strip() for linea in lineas]
-
+_GOOGLE_CLOUD_URL = "https://translation.googleapis.com/language/translate/v2"
+_PAUSA_TRAS_BLOQUEO = 600  # segundos sin usar un proveedor gratuito tras un bloqueo
+_bloqueado_hasta: dict[str, float] = {}
 
 _RE_SERVINGS = re.compile(r"^\s*(\d+(?:\s*[-–]\s*\d+)?)\s*(servings?|portions?|people|persons?)?\s*$", re.IGNORECASE)
 
@@ -329,7 +306,7 @@ _RE_SERVINGS = re.compile(r"^\s*(\d+(?:\s*[-–]\s*\d+)?)\s*(servings?|portions?
 def _servings_es(valor: Any) -> str | None:
     """Normaliza `servings` de API Ninjas: 1 / "1 Servings" -> "1 porción"; "4 servings" -> "4 porciones".
 
-    Devuelve None si el valor no sigue el patrón numérico (entonces se traduce con Google).
+    Devuelve None si el valor no sigue el patrón numérico (entonces se traduce como texto).
     """
     if valor is None or isinstance(valor, bool):
         return None
@@ -340,56 +317,158 @@ def _servings_es(valor: Any) -> str | None:
     return f"{numero} {'porción' if numero == '1' else 'porciones'}"
 
 
+def _disponible(proveedor: str) -> bool:
+    return time.monotonic() >= _bloqueado_hasta.get(proveedor, 0.0)
+
+
+def _marcar_bloqueo(proveedor: str, exc: Exception) -> None:
+    logger.warning(
+        "El traductor %s falló (%s: %s); se omite durante %d s.",
+        proveedor, type(exc).__name__, str(exc)[:160], _PAUSA_TRAS_BLOQUEO,
+    )
+    _bloqueado_hasta[proveedor] = time.monotonic() + _PAUSA_TRAS_BLOQUEO
+
+
+def _google_cloud(textos: list[str]) -> list[str]:
+    """API oficial de Google (v2): una sola petición para toda la lista."""
+    respuesta = httpx.post(
+        _GOOGLE_CLOUD_URL,
+        params={"key": settings.google_translate_api_key},
+        json={"q": textos, "source": "en", "target": "es", "format": "text"},
+        timeout=15.0,
+    )
+    respuesta.raise_for_status()
+    traducciones = respuesta.json()["data"]["translations"]
+    return [html.unescape(t["translatedText"]).strip() for t in traducciones]
+
+
+def _en_lotes(textos: list[str], limite: int) -> list[list[str]]:
+    """Agrupa textos en lotes cuyo total (unido con saltos de línea) no supere `limite`."""
+    lotes: list[list[str]] = []
+    actual: list[str] = []
+    largo = 0
+    for texto in textos:
+        if actual and largo + len(texto) + 1 > limite:
+            lotes.append(actual)
+            actual, largo = [], 0
+        actual.append(texto)
+        largo += len(texto) + 1
+    if actual:
+        lotes.append(actual)
+    return lotes
+
+
+def _con_deep_translator(traductor: Any, textos: list[str], limite: int) -> list[str]:
+    """Traduce por lotes unidos con '\\n'; si un lote pierde líneas, lo traduce ítem por ítem."""
+    salida: list[str] = []
+    for lote in _en_lotes(textos, limite):
+        unidas = (traductor.translate("\n".join(lote)) or "").strip()
+        lineas = [linea.strip() for linea in unidas.split("\n") if linea.strip()]
+        if len(lineas) != len(lote):
+            lineas = [(traductor.translate(t[:limite]) or t).strip() for t in lote]
+        salida.extend(lineas)
+    return salida
+
+
+def _proveedores() -> list[tuple[str, Callable[[list[str]], list[str]]]]:
+    cadena: list[tuple[str, Callable[[list[str]], list[str]]]] = []
+    if settings.google_translate_api_key:
+        cadena.append(("Google Cloud", _google_cloud))
+    cadena.append((
+        "Google gratuito",
+        lambda textos: _con_deep_translator(GoogleTranslator(source="en", target="es"), textos, 4500),
+    ))
+    cadena.append((
+        "MyMemory",
+        lambda textos: _con_deep_translator(MyMemoryTranslator(source="en-GB", target="es-ES"), textos, 450),
+    ))
+    return cadena
+
+
+def traducir_lista(textos: list[str]) -> tuple[list[str], bool]:
+    """Traduce una lista inglés → español con la cadena de proveedores.
+
+    Devuelve (textos, traducido). Si ningún proveedor responde, devuelve los
+    textos originales y `traducido=False` (sin lanzar excepciones).
+    """
+    limpios = [t.strip() for t in textos]
+    if not any(limpios):
+        return limpios, True
+    for nombre, funcion in _proveedores():
+        if not _disponible(nombre):
+            continue
+        try:
+            resultado = funcion(limpios)
+            if len(resultado) == len(limpios) and all(resultado):
+                return [r.replace(" ", " ").replace(" ", " ") for r in resultado], True
+            raise ValueError("la traducción no devolvió el mismo número de textos")
+        except Exception as exc:  # noqa: BLE001 - se prueba el siguiente proveedor
+            _marcar_bloqueo(nombre, exc)
+    logger.warning("Ningún traductor respondió; %d texto(s) quedan en inglés.", len(limpios))
+    return limpios, False
+
+
 def _traducir_buscada(q: str) -> str:
     """Español → inglés de la búsqueda con GoogleTranslator; si falla, usa el diccionario local."""
-    try:
-        traducido = GoogleTranslator(source="es", target="en").translate(q.strip())
-        if traducido and traducido.strip():
-            return traducido.strip()
-    except Exception as exc:  # noqa: BLE001 - cualquier fallo usa el traductor local
-        logger.warning(
-            "GoogleTranslator no pudo traducir la búsqueda «%s» (%s: %s); se usa el traductor local.",
-            q, type(exc).__name__, exc,
-        )
+    if _disponible("Google gratuito"):
+        try:
+            traducido = GoogleTranslator(source="es", target="en").translate(q.strip())
+            if traducido and traducido.strip():
+                return traducido.strip()
+        except Exception as exc:  # noqa: BLE001 - cualquier fallo usa el traductor local
+            _marcar_bloqueo("Google gratuito", exc)
     return traducir_consulta(q)
 
 
-def _traducir_receta(receta: dict[str, Any]) -> dict[str, Any]:
-    """Traduce al español `title`, `servings`, `ingredients`, `instructions` y `pasos`
-    de una receta, manteniendo intactas las llaves del JSON que espera Angular.
+def _traducir_recetas(recetas: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], bool]:
+    """Traduce al español `title`, `servings`, `ingredients` y `pasos`/`instructions`
+    de todas las recetas en una sola tanda, campo por campo.
 
-    Si el traductor falla temporalmente, devuelve la receta original en inglés
-    sin propagar el error (sin 500).
+    Devuelve (recetas, todo_traducido). Si algo falla, ese campo queda en inglés
+    pero el resto sí se traduce; las porciones se convierten siempre.
     """
-    try:
-        traductor = GoogleTranslator(source="en", target="es")
-        salida = dict(receta)
+    textos: list[str] = []
+    destinos: list[tuple[int, str, int | None]] = []  # (receta, campo, posición en la lista)
+    salida = [dict(r) for r in recetas]
+
+    for i, receta in enumerate(salida):
         if receta.get("title"):
-            salida["title"] = _traducir_texto(traductor, str(receta["title"]))
+            destinos.append((i, "title", None))
+            textos.append(str(receta["title"]))
         servings = receta.get("servings")
         if servings not in (None, ""):
-            salida["servings"] = _servings_es(servings) or _traducir_texto(traductor, str(servings))
-        if receta.get("ingredients"):
-            salida["ingredients"] = _traducir_lineas(traductor, list(receta["ingredients"]))
+            fijo = _servings_es(servings)
+            if fijo:
+                receta["servings"] = fijo
+            else:
+                destinos.append((i, "servings", None))
+                textos.append(str(servings))
+        for j, ingrediente in enumerate(receta.get("ingredients") or []):
+            destinos.append((i, "ingredients", j))
+            textos.append(str(ingrediente))
         pasos = receta.get("pasos") or []
         if pasos:
-            # `instructions` se deriva de los pasos traducidos para que ambos textos coincidan.
-            salida["pasos"] = _traducir_lineas(traductor, list(pasos))
-            salida["instructions"] = " ".join(salida["pasos"])
+            receta["pasos"] = list(pasos)
+            for j, paso in enumerate(pasos):
+                destinos.append((i, "pasos", j))
+                textos.append(str(paso))
         elif receta.get("instructions"):
-            salida["instructions"] = _traducir_texto(traductor, str(receta["instructions"]))
-        return salida
-    except Exception as exc:  # noqa: BLE001 - red o límite de Google: receta en inglés
-        logger.warning(
-            "No se pudo traducir la receta «%s» (%s: %s); se devuelve en inglés.",
-            receta.get("title"), type(exc).__name__, exc,
-        )
-        return receta
+            destinos.append((i, "instructions", None))
+            textos.append(str(receta["instructions"]))
+        if receta.get("ingredients"):
+            receta["ingredients"] = list(receta["ingredients"])
 
-
-def _traducir_recetas(recetas: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Traduce todas las recetas al español (si una falla, queda en inglés)."""
-    return [_traducir_receta(receta) for receta in recetas]
+    traducidos, ok = traducir_lista(textos)
+    for (i, campo, j), texto in zip(destinos, traducidos):
+        if j is None:
+            salida[i][campo] = texto
+        else:
+            salida[i][campo][j] = texto
+    for receta in salida:
+        if receta.get("pasos"):
+            receta["instructions"] = " ".join(receta["pasos"])
+        receta["traducido"] = ok
+    return salida, ok
 
 
 @router.get("/externas", summary="Sugerencias de recetas con información nutricional (API Ninjas)")
@@ -418,13 +497,19 @@ async def recetas_externas(
             recetas = [_normalizar(r) for r in datos if isinstance(r, dict)]
             recetas = [r for r in recetas if r["title"]]
             if recetas:
-                # 2) Inglés → español de cada receta (si Google falla, queda en inglés, sin 500).
-                recetas = await asyncio.to_thread(_traducir_recetas, recetas)
-                salida = {"consulta": q, "consulta_en": query_en, "fuente": "API Ninjas", "total": len(recetas), "recetas": recetas}
-                # Se guarda la respuesta para responder al instante las próximas veces.
-                if len(_CACHE_RECETAS) >= _CACHE_MAXIMO:
-                    _CACHE_RECETAS.pop(next(iter(_CACHE_RECETAS)))  # la más antigua
-                _CACHE_RECETAS[clave] = {k: v for k, v in salida.items() if k != "consulta"}
+                # 2) Inglés → español de todas las recetas (si un proveedor falla, se usa el siguiente).
+                recetas, traducido = await asyncio.to_thread(_traducir_recetas, recetas)
+                salida = {
+                    "consulta": q, "consulta_en": query_en, "fuente": "API Ninjas",
+                    "traducido": traducido, "total": len(recetas), "recetas": recetas,
+                }
+                if not traducido:
+                    salida["aviso"] = "El servicio de traducción no respondió; algunos textos se muestran en inglés."
+                else:
+                    # Solo se cachean búsquedas traducidas por completo.
+                    if len(_CACHE_RECETAS) >= _CACHE_MAXIMO:
+                        _CACHE_RECETAS.pop(next(iter(_CACHE_RECETAS)))  # la más antigua
+                    _CACHE_RECETAS[clave] = {k: v for k, v in salida.items() if k != "consulta"}
                 return salida
             aviso = "API Ninjas no encontró recetas para su búsqueda. Se muestran sugerencias locales."
         except (httpx.HTTPError, ValueError) as exc:

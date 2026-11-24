@@ -124,3 +124,15 @@ del servicio (Render → *Settings → Deploy Hook*). Solo se usa en el job de d
 
 Si el smoke test de `/health/db` falla con `503`, revise que el proyecto de Supabase no esté pausado y que
 `DATABASE_URL` en Render sea correcta.
+
+## Datos adicionales (Supabase)
+
+`sql/002_regiones_y_recetas.sql` agrega **162 distritos de las 25 regiones del Perú** (foco en **Junín/Huancayo** con sus
+28 distritos y en los 43 distritos de **Lima**) y **6 recetas** más; `sql/003_insumos_adicionales.sql` agrega **12 insumos** (azúcar, sal, harina, quinua, huevos, leche fresca…). Pegue cada uno en el **SQL Editor de Supabase** (primero 002, luego 003): es
+incremental (`ON CONFLICT DO NOTHING`), no borra nada y **no requiere redesplegar**, porque la API lee las tablas en cada petición.
+
+## Traducción de recetas externas
+
+Cadena de proveedores: **Google Cloud Translation API** (solo si se define `GOOGLE_TRANSLATE_API_KEY` en Render) →
+Google gratuito → **MyMemory** → inglés. Las porciones (`1 Servings` → `1 porción`) se convierten siempre y solo se
+guardan en caché las búsquedas traducidas por completo.
