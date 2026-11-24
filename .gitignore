@@ -1,0 +1,36 @@
+# ==========================================================================
+# AYNI · Backend (Python / FastAPI)
+# ==========================================================================
+
+# ---------- Secretos (el ejemplo sí se versiona) ----------
+.env
+.env.*
+!.env.example
+
+# ---------- Entornos virtuales ----------
+venv/
+.venv/
+env/
+ENV/
+
+# ---------- Cachés y compilados de Python ----------
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# ---------- Empaquetado ----------
+build/
+dist/
+*.egg-info/
+
+# ---------- Editores y sistema ----------
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

@@ -1,0 +1,17 @@
+# Secretos: nunca dentro de la imagen (en Render se definen como variables de entorno)
+.env
+.env.*
+!.env.example
+
+# Entornos y cachés locales
+.venv/
+__pycache__/
+**/__pycache__/
+*.pyc
+.pytest_cache/
+
+# No necesarios en producción
+tests/
+requirements.txt
+Dockerfile
+.dockerignore
