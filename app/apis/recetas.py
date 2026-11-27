@@ -11,7 +11,7 @@ from typing import Any, Callable
 
 import httpx
 import psycopg
-from deep_translator import GoogleTranslator, MyMemoryTranslator
+from deep_translator import MyMemoryTranslator
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 
 from app.core.config import settings
@@ -282,12 +282,17 @@ def _normalizar(item: dict[str, Any]) -> dict[str, Any]:
 #
 #   1. Google Cloud Translation API (oficial) — solo si GOOGLE_TRANSLATE_API_KEY
 #      está configurada; traduce listas completas en una sola petición.
-#   2. Google Translate gratuito (deep-translator) — sin clave, pero Google lo
-#      bloquea con frecuencia (TooManyRequests); tras un bloqueo se omite unos
-#      minutos para no insistir.
+#   2. Google Translate gratuito (endpoint público translate.googleapis.com,
+#      client=gtx, vía httpx) — sin clave, rápido y conserva los saltos de
+#      línea. (deep-translator usaba otra URL que Google bloquea siempre con
+#      TooManyRequests, por eso ya no se usa.)
 #   3. MyMemory (deep-translator) — gratuito, sin clave, máx. ~500 caracteres
-#      por petición.
+#      por petición y ~5000 caracteres al día por IP; si agotó su cuota, su
+#      aviso se detecta y no se muestra como "traducción".
 #   4. Si todos fallan: el texto queda en inglés (se registra en el log).
+#
+# Si un proveedor falla a mitad de camino, lo ya traducido se conserva y el
+# siguiente proveedor solo traduce lo que faltaba.
 #
 # Las porciones ("1 Servings") se convierten siempre con una regla propia, sin
 # depender de ningún proveedor. Solo se guardan en caché las búsquedas que se
@@ -297,7 +302,8 @@ def _normalizar(item: dict[str, Any]) -> dict[str, Any]:
 _CACHE_RECETAS: dict[str, dict[str, Any]] = {}
 _CACHE_MAXIMO = 100
 _GOOGLE_CLOUD_URL = "https://translation.googleapis.com/language/translate/v2"
-_PAUSA_TRAS_BLOQUEO = 600  # segundos sin usar un proveedor gratuito tras un bloqueo
+_GOOGLE_GTX_URL = "https://translate.googleapis.com/translate_a/single"
+_PAUSA_TRAS_BLOQUEO = 120  # segundos sin usar un proveedor tras un fallo
 _bloqueado_hasta: dict[str, float] = {}
 
 _RE_SERVINGS = re.compile(r"^\s*(\d+(?:\s*[-–]\s*\d+)?)\s*(servings?|portions?|people|persons?)?\s*$", re.IGNORECASE)
@@ -358,30 +364,49 @@ def _en_lotes(textos: list[str], limite: int) -> list[list[str]]:
     return lotes
 
 
-def _con_deep_translator(traductor: Any, textos: list[str], limite: int) -> list[str]:
-    """Traduce por lotes unidos con '\\n'; si un lote pierde líneas, lo traduce ítem por ítem."""
-    salida: list[str] = []
+def _google_gtx(texto: str, origen: str = "en", destino: str = "es") -> str:
+    """Google Translate gratuito (client=gtx). Respeta los saltos de línea del texto."""
+    respuesta = httpx.post(
+        _GOOGLE_GTX_URL,
+        params={"client": "gtx", "sl": origen, "tl": destino, "dt": "t"},
+        data={"q": texto},
+        timeout=10.0,
+    )
+    respuesta.raise_for_status()
+    segmentos = respuesta.json()[0] or []
+    return "".join(s[0] for s in segmentos if s and s[0])
+
+
+def _mymemory(texto: str) -> str:
+    traducido = MyMemoryTranslator(source="en-GB", target="es-ES").translate(texto) or ""
+    if "MYMEMORY WARNING" in traducido.upper() or "QUERY LENGTH LIMIT" in traducido.upper():
+        raise RuntimeError("MyMemory agotó su cuota gratuita diaria")
+    return traducido
+
+
+def _por_lotes(traducir: Callable[[str], str], textos: list[str], limite: int, avance: list[str]) -> list[str]:
+    """Traduce por lotes unidos con '\\n'; si un lote pierde líneas, lo traduce ítem por ítem.
+
+    Cada lote terminado se agrega a `avance`, así un fallo a mitad de camino no
+    pierde lo que ya se tradujo.
+    """
     for lote in _en_lotes(textos, limite):
-        unidas = (traductor.translate("\n".join(lote)) or "").strip()
+        unidas = (traducir("\n".join(lote)) or "").strip()
         lineas = [linea.strip() for linea in unidas.split("\n") if linea.strip()]
         if len(lineas) != len(lote):
-            lineas = [(traductor.translate(t[:limite]) or t).strip() for t in lote]
-        salida.extend(lineas)
-    return salida
+            lineas = [(traducir(t[:limite]) or "").strip() for t in lote]
+        if not all(lineas):
+            raise ValueError("la traducción devolvió textos vacíos")
+        avance.extend(lineas)
+    return avance
 
 
-def _proveedores() -> list[tuple[str, Callable[[list[str]], list[str]]]]:
-    cadena: list[tuple[str, Callable[[list[str]], list[str]]]] = []
+def _proveedores() -> list[tuple[str, Callable[[list[str], list[str]], list[str]]]]:
+    cadena: list[tuple[str, Callable[[list[str], list[str]], list[str]]]] = []
     if settings.google_translate_api_key:
-        cadena.append(("Google Cloud", _google_cloud))
-    cadena.append((
-        "Google gratuito",
-        lambda textos: _con_deep_translator(GoogleTranslator(source="en", target="es"), textos, 4500),
-    ))
-    cadena.append((
-        "MyMemory",
-        lambda textos: _con_deep_translator(MyMemoryTranslator(source="en-GB", target="es-ES"), textos, 450),
-    ))
+        cadena.append(("Google Cloud", lambda textos, avance: avance + _google_cloud(textos)))
+    cadena.append(("Google gratuito", lambda textos, avance: _por_lotes(_google_gtx, textos, 4500, avance)))
+    cadena.append(("MyMemory", lambda textos, avance: _por_lotes(_mymemory, textos, 450, avance)))
     return cadena
 
 
@@ -394,25 +419,32 @@ def traducir_lista(textos: list[str]) -> tuple[list[str], bool]:
     limpios = [t.strip() for t in textos]
     if not any(limpios):
         return limpios, True
+    hechos: list[str] = []  # traducciones ya obtenidas, en orden
     for nombre, funcion in _proveedores():
         if not _disponible(nombre):
             continue
+        avance: list[str] = []
         try:
-            resultado = funcion(limpios)
-            if len(resultado) == len(limpios) and all(resultado):
-                return [r.replace(" ", " ").replace(" ", " ") for r in resultado], True
+            funcion(limpios[len(hechos):], avance)
+            hechos.extend(avance)
+            if len(hechos) == len(limpios):
+                return [h.replace("\u00a0", " ").replace("\u202f", " ") for h in hechos], True
             raise ValueError("la traducción no devolvió el mismo número de textos")
         except Exception as exc:  # noqa: BLE001 - se prueba el siguiente proveedor
+            hechos.extend(avance[: len(limpios) - len(hechos)])
             _marcar_bloqueo(nombre, exc)
-    logger.warning("Ningún traductor respondió; %d texto(s) quedan en inglés.", len(limpios))
-    return limpios, False
+    logger.warning(
+        "Ningún traductor completó la tarea; %d de %d texto(s) quedan en inglés.",
+        len(limpios) - len(hechos), len(limpios),
+    )
+    return hechos + limpios[len(hechos):], False
 
 
 def _traducir_buscada(q: str) -> str:
-    """Español → inglés de la búsqueda con GoogleTranslator; si falla, usa el diccionario local."""
+    """Español → inglés de la búsqueda con Google gratuito (gtx); si falla, usa el diccionario local."""
     if _disponible("Google gratuito"):
         try:
-            traducido = GoogleTranslator(source="es", target="en").translate(q.strip())
+            traducido = _google_gtx(q.strip(), origen="es", destino="en")
             if traducido and traducido.strip():
                 return traducido.strip()
         except Exception as exc:  # noqa: BLE001 - cualquier fallo usa el traductor local

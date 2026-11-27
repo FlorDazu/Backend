@@ -17,14 +17,14 @@ router = APIRouter(prefix="/api", tags=["Kardex y reportes"])
 
 SQL_MOVIMIENTOS = """
 SELECT m.id_movimiento, m.codigo_correlativo, m.tipo_movimiento, m.fecha_movimiento,
-       m.id_insumo, i.nombre AS insumo, i.unidad_base,
+       l.id_insumo, i.nombre AS insumo, i.unidad_base,
        m.id_lote, l.codigo_lote, m.cantidad, m.saldo_anterior, m.saldo_posterior, m.motivo,
        m.id_usuario, u.nombre_completo AS usuario
 FROM dbo.movimientos_inventario m
-JOIN dbo.insumos i ON i.id_insumo = m.id_insumo
-JOIN dbo.usuarios u ON u.id_usuario = m.id_usuario
-LEFT JOIN dbo.lotes_inventario l ON l.id_lote = m.id_lote
-WHERE m.id_olla = ?
+JOIN dbo.lotes_inventario l ON l.id_lote = m.id_lote
+JOIN dbo.insumos i ON i.id_insumo = l.id_insumo
+LEFT JOIN dbo.usuarios u ON u.id_usuario = m.id_usuario
+WHERE l.id_olla = ?
 """
 
 
@@ -49,7 +49,7 @@ def _filtrar_movimientos(
         sql += " AND m.tipo_movimiento = ?"
         params.append(tipo)
     if id_insumo:
-        sql += " AND m.id_insumo = ?"
+        sql += " AND l.id_insumo = ?"
         params.append(id_insumo)
     if fecha_desde:
         sql += " AND m.fecha_movimiento >= ?"
@@ -104,10 +104,11 @@ def resumen(
     )
     movs = consultar(
         conn,
-        """SELECT tipo_movimiento, COUNT(*) AS cantidad_movimientos, SUM(cantidad) AS cantidad_total
-           FROM dbo.movimientos_inventario
-           WHERE id_olla = ? AND fecha_movimiento >= ? AND fecha_movimiento < ?
-           GROUP BY tipo_movimiento""",
+        """SELECT m.tipo_movimiento, COUNT(*) AS cantidad_movimientos, SUM(m.cantidad) AS cantidad_total
+           FROM dbo.movimientos_inventario m
+           JOIN dbo.lotes_inventario l ON l.id_lote = m.id_lote
+           WHERE l.id_olla = ? AND m.fecha_movimiento >= ? AND m.fecha_movimiento < ?
+           GROUP BY m.tipo_movimiento""",
         id_olla, desde, hasta,
     )
     despachos = consultar_uno(

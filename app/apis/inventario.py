@@ -167,8 +167,8 @@ def salida(
         conn,
         """SELECT m.codigo_correlativo, l.codigo_lote, m.cantidad, m.saldo_posterior
            FROM dbo.movimientos_inventario m
-           LEFT JOIN dbo.lotes_inventario l ON l.id_lote = m.id_lote
-           WHERE m.id_movimiento > ? AND m.id_olla = ? AND m.id_insumo = ? AND m.id_usuario = ?
+           JOIN dbo.lotes_inventario l ON l.id_lote = m.id_lote
+           WHERE m.id_movimiento > ? AND l.id_olla = ? AND l.id_insumo = ? AND m.id_usuario = ?
              AND m.tipo_movimiento = 'SALIDA'
            ORDER BY m.id_movimiento""",
         ultimo["ultimo"],
